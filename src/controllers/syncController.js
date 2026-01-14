@@ -86,21 +86,64 @@ const sync = async (req, res) => {
         }
     }
 
+    // Process Weight Logs changes
+    if (changes && changes.weight_logs && changes.weight_logs.length > 0) {
+        for (const log of changes.weight_logs) {
+            const { id, pig_id, weight, date_measured, deleted_at } = log;
+            const queryText = `
+                INSERT INTO weight_logs (id, pig_id, weight, date_measured, deleted_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    pig_id = EXCLUDED.pig_id,
+                    weight = EXCLUDED.weight,
+                    date_measured = EXCLUDED.date_measured,
+                    deleted_at = EXCLUDED.deleted_at,
+                    updated_at = NOW()
+            `;
+            await client.query(queryText, [id, pig_id, weight, date_measured, deleted_at || null]);
+        }
+    }
+
+    // Process Breeding Events changes
+    if (changes && changes.breeding_events && changes.breeding_events.length > 0) {
+        for (const event of changes.breeding_events) {
+            const { id, pig_id, event_type, details, event_date, deleted_at } = event;
+            const queryText = `
+                INSERT INTO breeding_events (id, pig_id, event_type, details, event_date, deleted_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    pig_id = EXCLUDED.pig_id,
+                    event_type = EXCLUDED.event_type,
+                    details = EXCLUDED.details,
+                    event_date = EXCLUDED.event_date,
+                    deleted_at = EXCLUDED.deleted_at,
+                    updated_at = NOW()
+            `;
+            await client.query(queryText, [id, pig_id, event_type, details, event_date, deleted_at || null]);
+        }
+    }
+
     // 2. Fetch updated records since lastPulledAt
     // If not provided, fetch all (initial sync)
     let pullPigsQuery = 'SELECT * FROM pigs';
     let pullHealthQuery = 'SELECT * FROM health_records';
+    let pullWeightQuery = 'SELECT * FROM weight_logs';
+    let pullBreedingQuery = 'SELECT * FROM breeding_events';
     const pullParams = [];
 
     if (lastPulledAt) {
       pullPigsQuery += ' WHERE updated_at > $1';
       pullHealthQuery += ' WHERE updated_at > $1';
+      pullWeightQuery += ' WHERE updated_at > $1';
+      pullBreedingQuery += ' WHERE updated_at > $1';
       // Ensure we stick to timezone format if needed, but PG handles ISO strings well
       pullParams.push(new Date(lastPulledAt)); 
     }
 
     const { rows: updatedPigs } = await client.query(pullPigsQuery, pullParams);
     const { rows: updatedHealth } = await client.query(pullHealthQuery, pullParams);
+    const { rows: updatedWeight } = await client.query(pullWeightQuery, pullParams);
+    const { rows: updatedBreeding } = await client.query(pullBreedingQuery, pullParams);
 
     await client.query('COMMIT');
 
@@ -117,6 +160,16 @@ const sync = async (req, res) => {
             created: [],
             updated: updatedHealth,
             deleted: []
+        },
+        weight_logs: {
+            created: [],
+            updated: updatedWeight,
+            deleted: [] // Soft deletes handled via status
+        },
+        breeding_events: {
+             created: [],
+             updated: updatedBreeding,
+             deleted: []
         }
       } 
     });
