@@ -123,27 +123,99 @@ const sync = async (req, res) => {
         }
     }
 
+    // --- MODULE 1: COSTS & INVENTORY ---
+    if (changes?.feed_inventory?.length > 0) {
+        for (const item of changes.feed_inventory) {
+            const { id, name, cost_per_kg, current_stock_kg, batch_number, deleted_at } = item;
+            await client.query(`
+                INSERT INTO feed_inventory (id, name, cost_per_kg, current_stock_kg, batch_number, deleted_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name, cost_per_kg=EXCLUDED.cost_per_kg, current_stock_kg=EXCLUDED.current_stock_kg, batch_number=EXCLUDED.batch_number, deleted_at=EXCLUDED.deleted_at, updated_at=NOW()
+            `, [id, name, cost_per_kg, current_stock_kg, batch_number, deleted_at || null]);
+        }
+    }
+    if (changes?.feed_usage?.length > 0) {
+        for (const item of changes.feed_usage) {
+            const { id, pig_id, feed_id, amount_kg, date, deleted_at } = item;
+            await client.query(`
+                INSERT INTO feed_usage (id, pig_id, feed_id, amount_kg, date, deleted_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    pig_id=EXCLUDED.pig_id, feed_id=EXCLUDED.feed_id, amount_kg=EXCLUDED.amount_kg, date=EXCLUDED.date, deleted_at=EXCLUDED.deleted_at, updated_at=NOW()
+            `, [id, pig_id, feed_id, amount_kg, date, deleted_at || null]);
+        }
+    }
+
+    // --- MODULE 2: BIOSECURITY ---
+    if (changes?.access_logs?.length > 0) {
+        for (const item of changes.access_logs) {
+            const { id, visitor_name, company, vehicle_plate, origin, risk_level, entry_time, exit_time, zone_id, deleted_at } = item;
+            await client.query(`
+                INSERT INTO access_logs (id, visitor_name, company, vehicle_plate, origin, risk_level, entry_time, exit_time, zone_id, deleted_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    visitor_name=EXCLUDED.visitor_name, company=EXCLUDED.company, vehicle_plate=EXCLUDED.vehicle_plate, origin=EXCLUDED.origin, risk_level=EXCLUDED.risk_level, entry_time=EXCLUDED.entry_time, exit_time=EXCLUDED.exit_time, zone_id=EXCLUDED.zone_id, deleted_at=EXCLUDED.deleted_at, updated_at=NOW()
+            `, [id, visitor_name, company, vehicle_plate, origin, risk_level, entry_time, exit_time, zone_id, deleted_at || null]);
+        }
+    }
+
+    // --- MODULE 3: GAMIFICATION ---
+    if (changes?.user_points?.length > 0) {
+        for (const item of changes.user_points) {
+            const { id, user_id, points, reason, event_date, deleted_at } = item;
+            await client.query(`
+                INSERT INTO user_points (id, user_id, points, reason, event_date, deleted_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    user_id=EXCLUDED.user_id, points=EXCLUDED.points, reason=EXCLUDED.reason, event_date=EXCLUDED.event_date, deleted_at=EXCLUDED.deleted_at, updated_at=NOW()
+            `, [id, user_id, points, reason, event_date, deleted_at || null]);
+        }
+    }
+
+
     // 2. Fetch updated records since lastPulledAt
     // If not provided, fetch all (initial sync)
     let pullPigsQuery = 'SELECT * FROM pigs';
     let pullHealthQuery = 'SELECT * FROM health_records';
     let pullWeightQuery = 'SELECT * FROM weight_logs';
     let pullBreedingQuery = 'SELECT * FROM breeding_events';
+    
+    // New tables queries
+    let pullFeedInvQuery = 'SELECT * FROM feed_inventory';
+    let pullFeedUsageQuery = 'SELECT * FROM feed_usage';
+    let pullAccessQuery = 'SELECT * FROM access_logs';
+    let pullZonesQuery = 'SELECT * FROM sanitary_zones';
+    let pullPointsQuery = 'SELECT * FROM user_points';
+
     const pullParams = [];
 
     if (lastPulledAt) {
+      const dateParam = new Date(lastPulledAt);
+      pullParams.push(dateParam);
+      
       pullPigsQuery += ' WHERE updated_at > $1';
       pullHealthQuery += ' WHERE updated_at > $1';
       pullWeightQuery += ' WHERE updated_at > $1';
       pullBreedingQuery += ' WHERE updated_at > $1';
-      // Ensure we stick to timezone format if needed, but PG handles ISO strings well
-      pullParams.push(new Date(lastPulledAt)); 
+      
+      pullFeedInvQuery += ' WHERE updated_at > $1';
+      pullFeedUsageQuery += ' WHERE updated_at > $1';
+      pullAccessQuery += ' WHERE updated_at > $1';
+      pullZonesQuery += ' WHERE updated_at > $1';
+      pullPointsQuery += ' WHERE updated_at > $1';
     }
 
     const { rows: updatedPigs } = await client.query(pullPigsQuery, pullParams);
     const { rows: updatedHealth } = await client.query(pullHealthQuery, pullParams);
     const { rows: updatedWeight } = await client.query(pullWeightQuery, pullParams);
     const { rows: updatedBreeding } = await client.query(pullBreedingQuery, pullParams);
+    
+    const { rows: updatedFeedInv } = await client.query(pullFeedInvQuery, pullParams);
+    const { rows: updatedFeedUsage } = await client.query(pullFeedUsageQuery, pullParams);
+    const { rows: updatedAccess } = await client.query(pullAccessQuery, pullParams);
+    const { rows: updatedZones } = await client.query(pullZonesQuery, pullParams);
+    const { rows: updatedPoints } = await client.query(pullPointsQuery, pullParams);
 
     await client.query('COMMIT');
 
@@ -151,26 +223,16 @@ const sync = async (req, res) => {
       status: 'success',
       timestamp: new Date().toISOString(),
       changes: {
-        pigs: {
-            created: [], 
-            updated: updatedPigs, 
-            deleted: [] 
-        },
-        health_records: {
-            created: [],
-            updated: updatedHealth,
-            deleted: []
-        },
-        weight_logs: {
-            created: [],
-            updated: updatedWeight,
-            deleted: [] // Soft deletes handled via status
-        },
-        breeding_events: {
-             created: [],
-             updated: updatedBreeding,
-             deleted: []
-        }
+        pigs: { created: [], updated: updatedPigs, deleted: [] },
+        health_records: { created: [], updated: updatedHealth, deleted: [] },
+        weight_logs: { created: [], updated: updatedWeight, deleted: [] },
+        breeding_events: { created: [], updated: updatedBreeding, deleted: [] },
+        
+        feed_inventory: { created: [], updated: updatedFeedInv, deleted: [] },
+        feed_usage: { created: [], updated: updatedFeedUsage, deleted: [] },
+        access_logs: { created: [], updated: updatedAccess, deleted: [] },
+        sanitary_zones: { created: [], updated: updatedZones, deleted: [] },
+        user_points: { created: [], updated: updatedPoints, deleted: [] }
       } 
     });
 
