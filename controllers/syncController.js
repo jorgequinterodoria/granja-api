@@ -125,8 +125,8 @@ const sync = async (req, res) => {
           // but usually pigs just have pen_id directly. If pen_id is missing, it's null.
           
           const q = `
-            INSERT INTO pigs (id, farm_id, pen_id, tag_number, sex, stage, birth_date, weight, status, created_at, updated_at, deleted_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'Activo'), $10, $11, $12)
+            INSERT INTO pigs (id, farm_id, pen_id, tag_number, sex, stage, birth_date, weight, status, created_at, updated_at, deleted_at, entry_date)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'Activo'), $10, $11, $12, $13)
             ON CONFLICT (id) DO UPDATE SET
               pen_id = EXCLUDED.pen_id,
               tag_number = EXCLUDED.tag_number,
@@ -136,7 +136,8 @@ const sync = async (req, res) => {
               weight = EXCLUDED.weight,
               status = EXCLUDED.status,
               updated_at = EXCLUDED.updated_at,
-              deleted_at = EXCLUDED.deleted_at
+              deleted_at = EXCLUDED.deleted_at,
+              entry_date = EXCLUDED.entry_date
           `;
           
           await client.query(q, [
@@ -146,12 +147,13 @@ const sync = async (req, res) => {
             r.tag_number, 
             r.sex, 
             r.stage, 
-            r.birth_date, 
+            (r.birth_date && r.birth_date !== '') ? r.birth_date : null, // Fix empty string date
             r.weight,
             r.status, 
             r.created_at || null, 
             r.updated_at || new Date().toISOString(), 
-            r.deleted_at || null
+            r.deleted_at || null,
+            (r.entry_date && r.entry_date !== '') ? r.entry_date : null
           ]);
         }
       };
