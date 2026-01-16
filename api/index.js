@@ -1,29 +1,50 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 require('dotenv').config();
-const { sync } = require('../src/controllers/syncController');
+
+// Controllers
+const authController = require('../controllers/authController');
+const syncController = require('../controllers/syncController');
+const farmController = require('../controllers/farmController');
+
+// Middleware
+const { authenticateToken, requirePermission } = require('../middleware/saasMiddleware');
 
 const app = express();
 
-// Middleware
+// Security & Parsing
+app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-// Routes
-app.get('/', (req, res) => {
-  res.send('Granja Porcina API is running');
-});
+// --- ROUTES ---
 
-// Sync Endpoint
-app.post('/api/sync', sync);
+// Health Check
+app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
-// Vercel Export
-// If running locally
-if (process.env.NODE_ENV !== 'production') {
+// Auth
+app.post('/api/auth/login', authController.login);
+
+// Admin / SaaS
+app.post('/api/admin/create-farm', authenticateToken, requirePermission('admin.manage'), farmController.createFarm);
+app.get('/api/admin/farms', authenticateToken, requirePermission('admin.manage'), farmController.listFarms);
+
+// Sync (Offline-First Core)
+// Unified endpoint (handles both push and pull)
+app.post('/api/sync', authenticateToken, syncController.sync);
+
+// Separate endpoints (kept for compatibility)
+app.post('/api/sync/push', authenticateToken, syncController.pushChanges);
+app.get('/api/sync/pull', authenticateToken, syncController.pullChanges);
+
+// Export for Vercel
+module.exports = app;
+
+// Local Development
+if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });
 }
-
-module.exports = app;
