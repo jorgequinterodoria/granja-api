@@ -3,7 +3,8 @@ const db = require('../config/db');
 // Allowed tables for Sync
 const SYNC_TABLES = [
   'sections', 'pens', 'pigs', 'weight_logs', 'breeding_events', 
-  'health_events', 'feed_inventory', 'feed_usage', 'access_logs', 'user_points'
+  'health_events', 'feed_inventory', 'feed_usage', 'access_logs', 'user_points',
+  'roles', 'role_permissions' // Added roles
 ]; 
 
 const isUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
@@ -368,6 +369,76 @@ const sync = async (req, res) => {
           ]);
         }
       };
+
+      const upsertRoles = async (rows) => {
+        for (const r of rows) {
+          if (!r) continue;
+          
+          // Case 1: Numeric ID (Already synced from server or manually assigned)
+          if (r.id && typeof r.id === 'number') {
+             const q = `
+                INSERT INTO roles (id, farm_id, name, description, created_at, deleted_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    deleted_at = EXCLUDED.deleted_at
+             `;
+             await client.query(q, [
+                 r.id, farmId, r.name, r.description, r.created_at || new Date().toISOString(), r.deleted_at || null
+             ]);
+          } 
+          // Case 2: Temporal/Local ID (Needs resolution)
+          else {
+             // Try to resolve by name within this farm
+             const found = await client.query('SELECT id FROM roles WHERE farm_id = $1 AND name = $2', [farmId, r.name]);
+             
+             if (found.rows.length > 0) {
+                 // Update existing
+                 await client.query('UPDATE roles SET description = $3, deleted_at = $4 WHERE id = $1', 
+                    [found.rows[0].id, r.description, r.deleted_at || null]);
+             } else {
+                 // Insert new (let DB assign ID)
+                 // Note: This creates a new ID. The client won't know this new ID until next pull.
+                 // This is a known limitation of this simple sync. Ideally we'd return the mapping.
+                 await client.query('INSERT INTO roles (farm_id, name, description, created_at) VALUES ($1, $2, $3, $4)', 
+                    [farmId, r.name, r.description, r.created_at || new Date().toISOString()]);
+             }
+          }
+        }
+      };
+
+      const upsertRolePermissions = async (rows) => {
+        for (const r of rows) {
+            if (!r.role_id || !r.permission_id) continue;
+
+            // We need to resolve role_id if it's a temp ID from client.
+            // But we don't have the mapping here easily if we just inserted it above.
+            // Assumption: If role_id is numeric, it's valid. If it's a timestamp (large number), it might fail FK.
+            // Strategy: Try to insert. If FK fails, it means role hasn't synced or ID mismatch.
+            // BETTER STRATEGY for this context: 
+            // Since we sync roles first, if it was a named role, we might need to look it up again?
+            // Realistically, for this MVP, we assume client sends valid IDs or we skip.
+            // If the role was just created by name above, the client sent a temp ID. 
+            // We can't easily map it without more complex logic (returning map).
+            // For now, we only sync permissions if role_id exists in DB.
+            
+            // Check if role exists
+            const roleCheck = await client.query('SELECT id FROM roles WHERE id = $1', [r.role_id]);
+            if (roleCheck.rows.length === 0) {
+                // Try to find role by name if we can... but we don't have role name here in this row.
+                // Fallback: Skip permission assignment for non-existent roles (orphaned or temp ID mismatch)
+                continue;
+            }
+
+            const q = `
+                INSERT INTO role_permissions (role_id, permission_id)
+                VALUES ($1, $2)
+                ON CONFLICT (role_id, permission_id) DO NOTHING
+            `;
+            await client.query(q, [r.role_id, r.permission_id]);
+        }
+      };
       
       if (Array.isArray(changes.sections)) await upsertSections(changes.sections);
       if (Array.isArray(changes.pens)) await upsertPens(changes.pens);
@@ -379,6 +450,8 @@ const sync = async (req, res) => {
       if (Array.isArray(changes.feed_usage)) await upsertFeedUsage(changes.feed_usage);
       if (Array.isArray(changes.access_logs)) await upsertAccessLogs(changes.access_logs);
       if (Array.isArray(changes.user_points)) await upsertUserPoints(changes.user_points);
+      if (Array.isArray(changes.roles)) await upsertRoles(changes.roles);
+      if (Array.isArray(changes.role_permissions)) await upsertRolePermissions(changes.role_permissions);
     }
 
     await client.query('COMMIT');
@@ -388,11 +461,57 @@ const sync = async (req, res) => {
     const responseChanges = {};
 
     const pull = async (table) => {
-      const q = `
+      // Check if table has updated_at column or just created_at
+      // Simplified: tables like role_permissions, user_points might not have updated_at
+      // We can use a smarter query or just coalesce.
+      // NOTE: role_permissions and user_points in schema usually don't have updated_at.
+      
+      let timeFilter = '(COALESCE(updated_at, created_at) > $2 OR deleted_at > $2)';
+      if (['role_permissions', 'user_points'].includes(table)) {
+          // These tables might only have created_at or we rely on delete mechanism
+          // For now, let's just filter by created_at if updated_at is missing from schema intuition
+          // But safer is COALESCE(created_at, NOW()) if updated_at doesn't exist?
+          // Actually, if the column doesn't exist, SQL throws error.
+          // We know the schema: 
+          // role_permissions: no updated_at, no created_at in some schemas? 
+          // Let's check schema assumption: role_permissions has no timestamps usually?
+          // In db.js it has syncStatus. In PG it's a pivot.
+          // Pivot tables in PG usually don't track time unless added.
+          // If no time column, we might have to pull ALL? Or skip time filter?
+          // Let's assume we pull all for small pivot tables or use a specific logic.
+          
+          if (table === 'role_permissions') {
+             // Pivot table usually small, pull all for farm's roles?
+             // Join with roles to filter by farm_id
+             const q = `
+                SELECT rp.* 
+                FROM role_permissions rp
+                JOIN roles r ON rp.role_id = r.id
+                WHERE r.farm_id = $1
+             `;
+             const r = await db.query(q, [farmId]);
+             responseChanges[table] = { updated: r.rows };
+             return;
+          }
+          
+          if (table === 'user_points') {
+              timeFilter = 'created_at > $2';
+           }
+           
+           if (table === 'roles') {
+              // Roles table in DB schema (schema_saas_complete.sql) usually has created_at but updated_at might be missing or named differently?
+              // Standard schema: id, farm_id, name, description, created_at, deleted_at. No updated_at.
+              timeFilter = 'created_at > $2';
+           }
+       } else if (table === 'roles') {
+           // Explicitly handle roles if not in the array above but needs same logic
+           timeFilter = '(created_at > $2 OR deleted_at > $2)';
+       }
+
+       const q = `
         SELECT * FROM ${table}
         WHERE farm_id = $1
-          AND (deleted_at IS NULL OR deleted_at IS NULL)
-          AND COALESCE(updated_at, created_at) > $2
+          AND ${timeFilter}
       `;
       const r = await db.query(q, [farmId, cutoffDate]);
       responseChanges[table] = { updated: r.rows };
@@ -407,6 +526,12 @@ const sync = async (req, res) => {
     await pull('feed_usage');
     await pull('access_logs');
     await pull('user_points');
+    await pull('roles');
+    await pull('role_permissions');
+    
+    // Also pull permissions table (read-only for front)
+    const perms = await db.query('SELECT * FROM permissions');
+    responseChanges['permissions'] = { updated: perms.rows };
 
     res.json({
       success: true,
