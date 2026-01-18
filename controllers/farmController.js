@@ -89,6 +89,31 @@ const listFarms = async (req, res) => {
       ORDER BY f.created_at DESC
     `);
 
+    // Enhance with admin email (fetching separately to avoid complex group by logic or subquery perf issues on large datasets, though subquery is fine here)
+    // Let's use a subquery approach for cleaner code in one go
+    const query = `
+      SELECT 
+        f.id, 
+        f.name, 
+        f.plan, 
+        f.created_at,
+        COUNT(DISTINCT u.id) as user_count,
+        (
+            SELECT u2.email 
+            FROM users u2 
+            JOIN roles r ON u2.role_id = r.id 
+            WHERE u2.farm_id = f.id AND r.name = 'Administrador' 
+            LIMIT 1
+        ) as admin_email
+      FROM farms f
+      LEFT JOIN users u ON f.id = u.farm_id AND u.deleted_at IS NULL
+      WHERE f.deleted_at IS NULL
+      GROUP BY f.id, f.name, f.plan, f.created_at
+      ORDER BY f.created_at DESC
+    `;
+    
+    const result = await db.query(query);
+
     res.json({ farms: result.rows });
   } catch (error) {
     console.error('List Farms Error:', error);
@@ -96,6 +121,60 @@ const listFarms = async (req, res) => {
   }
 };
 
-module.exports = { createFarm, listFarms };
+// Update Farm Plan
+const updatePlan = async (req, res) => {
+    const { id } = req.params;
+    const { plan } = req.body;
+
+    if (!['Free', 'Pro'].includes(plan)) {
+        return res.status(400).json({ error: 'Plan inválido' });
+    }
+
+    try {
+        await db.query('UPDATE farms SET plan = $1 WHERE id = $2', [plan, id]);
+        res.json({ message: 'Plan actualizado correctamente' });
+    } catch (error) {
+        console.error('Update Plan Error:', error);
+        res.status(500).json({ error: 'Error al actualizar el plan' });
+    }
+};
+
+// Reset Admin Password
+const resetAdminPassword = async (req, res) => {
+    const { id } = req.params; // farmId
+    const { newPassword } = req.body;
+
+    if (!newPassword || newPassword.length < 6) {
+        return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+    }
+
+    try {
+        // Find the admin user for this farm
+        const adminRes = await db.query(`
+            SELECT u.id 
+            FROM users u
+            JOIN roles r ON u.role_id = r.id
+            WHERE u.farm_id = $1 AND r.name = 'Administrador'
+            LIMIT 1
+        `, [id]);
+
+        if (adminRes.rows.length === 0) {
+            return res.status(404).json({ error: 'No se encontró un usuario administrador para esta granja' });
+        }
+
+        const adminId = adminRes.rows[0].id;
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+        await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashedPassword, adminId]);
+
+        res.json({ message: 'Contraseña del administrador actualizada correctamente' });
+
+    } catch (error) {
+        console.error('Reset Admin Password Error:', error);
+        res.status(500).json({ error: 'Error al restablecer la contraseña' });
+    }
+};
+
+module.exports = { createFarm, listFarms, updatePlan, resetAdminPassword };
 
 

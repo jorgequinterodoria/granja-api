@@ -34,6 +34,8 @@ app.post('/api/auth/login', authController.login);
 // Admin / SaaS
 app.post('/api/admin/create-farm', authenticateToken, requirePermission('admin.manage'), farmController.createFarm);
 app.get('/api/admin/farms', authenticateToken, requirePermission('admin.manage'), farmController.listFarms);
+app.put('/api/admin/farms/:id/plan', authenticateToken, requirePermission('admin.manage'), farmController.updatePlan);
+app.post('/api/admin/farms/:id/reset-admin', authenticateToken, requirePermission('admin.manage'), farmController.resetAdminPassword);
 
 // Advanced Modules (Admin Only)
 app.get('/api/pigs/check-breeding', authenticateToken, requirePermission('admin.manage'), breedingController.checkBreeding);

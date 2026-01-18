@@ -16,7 +16,13 @@ const authenticateToken = async (req, res, next) => {
     // but ensures every subsequent query uses req.farmId
     req.farmId = decoded.farmId; 
     const isUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
-    if (!req.farmId || !isUUID(req.farmId)) {
+
+    // Allow SuperAdmin to bypass tenant context check
+    const permissions = decoded.permissions || [];
+    const isSuperAdmin = permissions.includes('admin.*') || permissions.includes('admin.manage');
+
+    // Only enforce tenant context if NOT superadmin
+    if (!isSuperAdmin && (!req.farmId || !isUUID(req.farmId))) {
       const result = await db.query('SELECT farm_id FROM users WHERE id = $1 AND deleted_at IS NULL', [req.user.id]);
       if (result.rows.length === 0 || !result.rows[0].farm_id) {
         return res.status(403).json({ error: 'Invalid tenant context' });
