@@ -7,6 +7,8 @@ require('dotenv').config();
 const authController = require('../controllers/authController');
 const syncController = require('../controllers/syncController');
 const farmController = require('../controllers/farmController');
+const breedingController = require('../controllers/breedingController');
+const dashboardController = require('../controllers/dashboardController');
 
 // Middleware
 const { authenticateToken, requirePermission } = require('../middleware/saasMiddleware');
@@ -29,6 +31,10 @@ app.post('/api/auth/login', authController.login);
 // Admin / SaaS
 app.post('/api/admin/create-farm', authenticateToken, requirePermission('admin.manage'), farmController.createFarm);
 app.get('/api/admin/farms', authenticateToken, requirePermission('admin.manage'), farmController.listFarms);
+
+// Advanced Modules (Admin Only)
+app.get('/api/pigs/check-breeding', authenticateToken, requirePermission('admin.manage'), breedingController.checkBreeding);
+app.get('/api/dashboard/tasks', authenticateToken, requirePermission('admin.manage'), dashboardController.getTasks);
 
 // Sync (Offline-First Core)
 // Unified endpoint (handles both push and pull)
