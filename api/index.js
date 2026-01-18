@@ -10,6 +10,9 @@ const farmController = require('../controllers/farmController');
 const breedingController = require('../controllers/breedingController');
 const dashboardController = require('../controllers/dashboardController');
 
+// Routes
+const userRoutes = require('../routes/userRoutes');
+
 // Middleware
 const { authenticateToken, requirePermission } = require('../middleware/saasMiddleware');
 
@@ -43,6 +46,9 @@ app.post('/api/sync', authenticateToken, syncController.sync);
 // Separate endpoints (kept for compatibility)
 app.post('/api/sync/push', authenticateToken, syncController.pushChanges);
 app.get('/api/sync/pull', authenticateToken, syncController.pullChanges);
+
+// Users Management
+app.use('/api/users', authenticateToken, userRoutes);
 
 // Export for Vercel
 module.exports = app;
