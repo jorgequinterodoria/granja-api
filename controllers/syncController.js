@@ -1,132 +1,31 @@
+
 const db = require('../config/db');
 
-// Allowed tables for Sync
-const SYNC_TABLES = [
-  'sections', 'pens', 'pigs', 'weight_logs', 'breeding_events', 
-  'health_events', 'feed_inventory', 'feed_usage', 'access_logs', 'user_points'
-]; 
-
-const isUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
-
-// Unified sync endpoint (handles both push and pull)
 const sync = async (req, res) => {
-  const { changes, lastPulledAt } = req.body;
-  const farmId = req.farmId;
-
-  if (!farmId) {
-    return res.status(400).json({ error: 'Farm ID required for sync' });
-  }
-
   const client = await db.pool.connect();
-
   try {
+    const { changes, lastPulledAt } = req.body;
+    const farmId = req.user.farmId || req.user.farm_id; // Ensure we get the farm ID
+
+    if (!farmId) {
+        throw new Error("Farm ID is missing from user context");
+    }
+
     await client.query('BEGIN');
-    
-    if (changes) {
-      // Helper to resolve section from various input formats
-      const getFarmIdForSection = async (sectionId) => {
-        if (sectionId == null) return null;
-        if (typeof sectionId === 'string' && !/^\d+$/.test(sectionId)) return null; // Avoid UUID syntax error for int column
-        const r = await db.query('SELECT farm_id FROM sections WHERE id = $1', [sectionId]);
-        return r.rows.length ? r.rows[0].farm_id : null;
-      };
 
-      const resolveSection = async (rawSec, rawName, tenantFarmId) => {
-        if (rawSec == null) return { id: null, farmId: tenantFarmId };
-        
-        // number -> direct id
-        if (typeof rawSec === 'number') {
-          const fid = await getFarmIdForSection(rawSec);
-          return { id: rawSec, farmId: fid || tenantFarmId };
-        }
-        
-        // string handling
-        if (typeof rawSec === 'string') {
-          const trimmed = rawSec.trim();
-          
-          // if UUID-like string (local ID), check if we have a name to resolve
-          if (isUUID(trimmed)) {
-            if (rawName && typeof rawName === 'string' && rawName.trim().length > 0) {
-              const name = rawName.trim();
-              // Try to find by name in tenant
-              const found = await db.query(
-                'SELECT id, farm_id FROM sections WHERE farm_id = $1 AND name = $2',
-                [tenantFarmId, name]
-              );
-              if (found.rows.length) {
-                return { id: found.rows[0].id, farmId: found.rows[0].farm_id };
-              }
-              // Create if not exists
-              const ins = await db.query(
-                'INSERT INTO sections (farm_id, name, created_at) VALUES ($1, $2, NOW()) RETURNING id, farm_id',
-                [tenantFarmId, name]
-              );
-              return { id: ins.rows[0].id, farmId: ins.rows[0].farm_id };
-            }
-            // UUID without name -> cannot resolve to section, return null section but valid tenant farm
-            return { id: null, farmId: tenantFarmId };
-          }
+    // --- Helper Functions (Closure over client & farmId) ---
 
-          // Numeric string -> parse and use
-          if (/^\d+$/.test(trimmed)) {
-            const sid = parseInt(trimmed);
-            const fid = await getFarmIdForSection(sid);
-            return { id: sid, farmId: fid || tenantFarmId };
-          }
-
-          // Non-numeric, non-UUID string -> treat as section NAME
-          const found = await db.query(
-            'SELECT id, farm_id FROM sections WHERE farm_id = $1 AND name = $2',
-            [tenantFarmId, trimmed]
-          );
-          if (found.rows.length) {
-            return { id: found.rows[0].id, farmId: found.rows[0].farm_id };
-          }
-          const ins = await db.query(
-            'INSERT INTO sections (farm_id, name, created_at) VALUES ($1, $2, NOW()) RETURNING id, farm_id',
-            [tenantFarmId, trimmed]
-          );
-          return { id: ins.rows[0].id, farmId: ins.rows[0].farm_id };
-        }
-
-        // object { id } or { name }
-        if (typeof rawSec === 'object') {
-          if (rawSec.id != null) {
-            const sid = (typeof rawSec.id === 'string' && /^\d+$/.test(rawSec.id)) ? parseInt(rawSec.id) : rawSec.id;
-            if (typeof sid === 'number') {
-                const fid = await getFarmIdForSection(sid);
-                return { id: sid, farmId: fid || tenantFarmId };
-            }
-          }
-          if (rawSec.name) {
-            const name = String(rawSec.name).trim();
-            const found = await db.query(
-              'SELECT id, farm_id FROM sections WHERE farm_id = $1 AND name = $2',
-              [tenantFarmId, name]
-            );
-            if (found.rows.length) {
-              return { id: found.rows[0].id, farmId: found.rows[0].farm_id };
-            }
-            const ins = await db.query(
-              'INSERT INTO sections (farm_id, name, created_at) VALUES ($1, $2, NOW()) RETURNING id, farm_id',
-              [tenantFarmId, name]
-            );
-            return { id: ins.rows[0].id, farmId: ins.rows[0].farm_id };
-          }
-        }
-        
-        return { id: null, farmId: tenantFarmId };
-      };
-
-      const upsertPigs = async (rows) => {
+    const upsertPigs = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
-          // Normalize pen_id from string/UUID/Number using same logic if needed, 
-          // but usually pigs just have pen_id directly. If pen_id is missing, it's null.
           
           const q = `
-            INSERT INTO pigs (id, farm_id, pen_id, tag_number, sex, stage, birth_date, weight, status, created_at, updated_at, deleted_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'Activo'), $10, $11, $12)
+            INSERT INTO pigs (
+                id, farm_id, pen_id, tag_number, sex, stage, birth_date, weight, status, 
+                created_at, updated_at, deleted_at, entry_date,
+                father_id, mother_id, genetics_score
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'Activo'), $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (id) DO UPDATE SET
               pen_id = EXCLUDED.pen_id,
               tag_number = EXCLUDED.tag_number,
@@ -136,7 +35,11 @@ const sync = async (req, res) => {
               weight = EXCLUDED.weight,
               status = EXCLUDED.status,
               updated_at = EXCLUDED.updated_at,
-              deleted_at = EXCLUDED.deleted_at
+              deleted_at = EXCLUDED.deleted_at,
+              entry_date = EXCLUDED.entry_date,
+              father_id = EXCLUDED.father_id,
+              mother_id = EXCLUDED.mother_id,
+              genetics_score = EXCLUDED.genetics_score
           `;
           
           await client.query(q, [
@@ -146,16 +49,21 @@ const sync = async (req, res) => {
             r.tag_number, 
             r.sex, 
             r.stage, 
-            r.birth_date, 
+            (r.birth_date && r.birth_date !== '') ? r.birth_date : null,
             r.weight,
             r.status, 
             r.created_at || null, 
             r.updated_at || new Date().toISOString(), 
-            r.deleted_at || null
+            r.deleted_at || null,
+            (r.entry_date && r.entry_date !== '') ? r.entry_date : null,
+            r.father_id || null,
+            r.mother_id || null,
+            r.genetics_score || null
           ]);
         }
-      };
-      const upsertWeightLogs = async (rows) => {
+    };
+
+    const upsertWeightLogs = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
           const q = `
@@ -171,8 +79,9 @@ const sync = async (req, res) => {
             r.id, farmId, r.pig_id, r.weight, r.date, r.created_at || new Date().toISOString(), r.deleted_at || null
           ]);
         }
-      };
-      const upsertBreedingEvents = async (rows) => {
+    };
+
+    const upsertBreedingEvents = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
           const q = `
@@ -189,27 +98,62 @@ const sync = async (req, res) => {
             r.id, farmId, r.pig_id, r.event_type, r.date, r.details || null, r.created_at || new Date().toISOString(), r.deleted_at || null
           ]);
         }
-      };
-      const upsertHealthEvents = async (rows) => {
+    };
+
+    const upsertHealthEvents = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
           const q = `
-            INSERT INTO health_events (id, farm_id, pig_id, type, description, date, cost, created_at, deleted_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO health_events (
+                id, farm_id, pig_id, type, description, date, cost, created_at, deleted_at,
+                medication_id, withdrawal_end_date
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (id) DO UPDATE SET
               pig_id = EXCLUDED.pig_id,
               type = EXCLUDED.type,
               description = EXCLUDED.description,
               date = EXCLUDED.date,
               cost = EXCLUDED.cost,
+              deleted_at = EXCLUDED.deleted_at,
+              medication_id = EXCLUDED.medication_id,
+              withdrawal_end_date = EXCLUDED.withdrawal_end_date
+          `;
+          await client.query(q, [
+            r.id, 
+            farmId, 
+            r.pig_id, 
+            r.type, 
+            r.description || null, 
+            r.date, 
+            r.cost || 0, 
+            r.created_at || new Date().toISOString(), 
+            r.deleted_at || null,
+            r.medication_id || null,
+            r.withdrawal_end_date || null
+          ]);
+        }
+    };
+
+    const upsertMedications = async (rows) => {
+        for (const r of rows) {
+          if (!r || !r.id) continue;
+          const q = `
+            INSERT INTO medications (id, farm_id, name, withdrawal_days, created_at, updated_at, deleted_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO UPDATE SET
+              name = EXCLUDED.name,
+              withdrawal_days = EXCLUDED.withdrawal_days,
+              updated_at = EXCLUDED.updated_at,
               deleted_at = EXCLUDED.deleted_at
           `;
           await client.query(q, [
-            r.id, farmId, r.pig_id, r.type, r.description || null, r.date, r.cost || 0, r.created_at || new Date().toISOString(), r.deleted_at || null
+            r.id, farmId, r.name, r.withdrawal_days || 0, r.created_at || null, r.updated_at || new Date().toISOString(), r.deleted_at || null
           ]);
         }
-      };
-      const upsertFeedInventory = async (rows) => {
+    };
+
+    const upsertFeedInventory = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
           const q = `
@@ -227,8 +171,9 @@ const sync = async (req, res) => {
             r.id, farmId, r.name, r.cost_per_kg, r.current_stock, r.batch_code || null, r.created_at || null, r.updated_at || new Date().toISOString(), r.deleted_at || null
           ]);
         }
-      };
-      const upsertFeedUsage = async (rows) => {
+    };
+
+    const upsertFeedUsage = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
           const q = `
@@ -246,8 +191,9 @@ const sync = async (req, res) => {
             r.id, farmId, r.feed_id, r.pen_id, r.pig_id, r.amount_kg, r.date, r.created_at || new Date().toISOString(), r.deleted_at || null
           ]);
         }
-      };
-      const upsertSections = async (rows) => {
+    };
+
+    const upsertSections = async (rows) => {
         for (const r of rows) {
           if (!r) continue;
           const isNumericId = typeof r.id === 'number' || (typeof r.id === 'string' && /^\d+$/.test(r.id));
@@ -280,24 +226,32 @@ const sync = async (req, res) => {
             }
           }
         }
-      };
-      
-      const upsertPens = async (rows) => {
+    };
+
+    // Helper to resolve Section for Pens
+    const resolveSection = async (secId, secName) => {
+        if (secId && (typeof secId === 'number' || /^\d+$/.test(secId))) return { id: parseInt(secId) };
+        if (secName) {
+             const found = await client.query('SELECT id FROM sections WHERE farm_id = $1 AND name = $2', [farmId, secName]);
+             if (found.rows.length > 0) return { id: found.rows[0].id };
+        }
+        return { id: null };
+    };
+
+    const upsertPens = async (rows) => {
         for (const r of rows) {
           if (!r) continue;
           const isNumericId = typeof r.id === 'number' || (typeof r.id === 'string' && /^\d+$/.test(r.id));
           
-          // Resolve section and its farm_id
           const rawSec = r.section_id ?? r.sectionId;
           const rawName = r.section_name ?? r.sectionName;
-          const tenantFarmId = isUUID(farmId) ? farmId : null; // fallback
           
-          const { id: secId, farmId: penFarmId } = await resolveSection(rawSec, rawName, tenantFarmId);
+          const { id: secId } = await resolveSection(rawSec, rawName);
           
-          if (!penFarmId) {
-             // Should not happen if tenantFarmId is valid, but safety check
-             console.warn('Could not resolve farm ID for pen', r);
-             continue; 
+          if (!secId) {
+             console.warn('Could not resolve section for pen', r);
+             // We can't insert a pen without a section if schema requires it, or we insert null
+             // Proceeding if schema allows null, otherwise this might fail.
           }
 
           if (isNumericId && r.id) {
@@ -311,29 +265,29 @@ const sync = async (req, res) => {
                 deleted_at = EXCLUDED.deleted_at
             `;
             await client.query(q, [
-              parseInt(r.id), penFarmId, secId, r.name, r.capacity || 0, r.created_at || new Date().toISOString(), r.deleted_at || null
+              parseInt(r.id), farmId, secId, r.name, r.capacity || 0, r.created_at || new Date().toISOString(), r.deleted_at || null
             ]);
           } else {
             const found = await client.query(
               `SELECT id FROM pens WHERE farm_id = $1 AND name = $2`,
-              [penFarmId, r.name]
+              [farmId, r.name]
             );
             if (found.rows.length > 0) {
               await client.query(
                 `UPDATE pens SET section_id = $3, capacity = $4, deleted_at = $5 WHERE id = $1 AND farm_id = $2`,
-                [found.rows[0].id, penFarmId, secId, r.capacity || 0, r.deleted_at || null]
+                [found.rows[0].id, farmId, secId, r.capacity || 0, r.deleted_at || null]
               );
             } else {
               await client.query(
                 `INSERT INTO pens (farm_id, section_id, name, capacity, created_at) VALUES ($1, $2, $3, $4, $5)`,
-                [penFarmId, secId, r.name, r.capacity || 0, r.created_at || new Date().toISOString()]
+                [farmId, secId, r.name, r.capacity || 0, r.created_at || new Date().toISOString()]
               );
             }
           }
         }
-      };
-      
-      const upsertAccessLogs = async (rows) => {
+    };
+
+    const upsertAccessLogs = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
           const q = `
@@ -349,8 +303,9 @@ const sync = async (req, res) => {
             r.id, farmId, r.visitor_name || null, r.origin || null, r.is_safe_origin, r.entry_time, r.created_at
           ]);
         }
-      };
-      const upsertUserPoints = async (rows) => {
+    };
+
+    const upsertUserPoints = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
           const q = `
@@ -365,8 +320,66 @@ const sync = async (req, res) => {
             r.id, farmId, r.user_id, r.points, r.reason || null, r.created_at
           ]);
         }
-      };
-      
+    };
+
+    const upsertRoles = async (rows) => {
+        for (const r of rows) {
+          if (!r) continue;
+          
+          // Now using UUIDs for all roles
+          if (r.id) {
+             const q = `
+                INSERT INTO roles (id, farm_id, name, description, created_at, deleted_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    deleted_at = EXCLUDED.deleted_at
+             `;
+             await client.query(q, [
+                 r.id, farmId, r.name, r.description, r.created_at || new Date().toISOString(), r.deleted_at || null
+             ]);
+          } else {
+             // Fallback if no ID provided (should not happen with updated frontend)
+             // Try to find by name
+             const found = await client.query('SELECT id FROM roles WHERE farm_id = $1 AND name = $2', [farmId, r.name]);
+             
+             if (found.rows.length > 0) {
+                 await client.query('UPDATE roles SET description = $2, deleted_at = $3 WHERE id = $1', 
+                    [found.rows[0].id, r.description || null, r.deleted_at || null]);
+             } else {
+                 await client.query('INSERT INTO roles (farm_id, name, description, created_at) VALUES ($1, $2, $3, $4)', 
+                    [farmId, r.name, r.description, r.created_at || new Date().toISOString()]);
+             }
+          }
+        }
+    };
+
+    const upsertRolePermissions = async (rows) => {
+        for (const r of rows) {
+            if (!r.role_id || !r.permission_id) continue;
+            
+            // Standard upsert
+            const q = `
+                INSERT INTO role_permissions (role_id, permission_id)
+                VALUES ($1, $2)
+                ON CONFLICT (role_id, permission_id) DO NOTHING
+            `;
+            // We can optionally check if role exists to avoid FK error if role sync failed
+            // but in a transaction with upsertRoles first, it should be fine.
+            try {
+                await client.query(q, [r.role_id, r.permission_id]);
+            } catch (err) {
+                // Ignore FK violation if role doesn't exist (e.g. partial sync)
+                if (err.code !== '23503') throw err;
+                console.warn(`Skipping permission for missing role: ${r.role_id}`);
+            }
+        }
+    };
+
+
+    // --- Execute Changes ---
+    if (changes) {
       if (Array.isArray(changes.sections)) await upsertSections(changes.sections);
       if (Array.isArray(changes.pens)) await upsertPens(changes.pens);
       if (Array.isArray(changes.pigs)) await upsertPigs(changes.pigs);
@@ -377,153 +390,117 @@ const sync = async (req, res) => {
       if (Array.isArray(changes.feed_usage)) await upsertFeedUsage(changes.feed_usage);
       if (Array.isArray(changes.access_logs)) await upsertAccessLogs(changes.access_logs);
       if (Array.isArray(changes.user_points)) await upsertUserPoints(changes.user_points);
+      
+      if (Array.isArray(changes.roles)) await upsertRoles(changes.roles);
+      if (Array.isArray(changes.role_permissions)) await upsertRolePermissions(changes.role_permissions);
+      
+      if (Array.isArray(changes.medications)) await upsertMedications(changes.medications);
     }
 
     await client.query('COMMIT');
 
-    // PULL: Get updates since lastPulledAt
+    // --- Pull Logic ---
     const cutoffDate = lastPulledAt ? new Date(lastPulledAt) : new Date(0);
     const responseChanges = {};
 
-    const pull = async (table) => {
-      const q = `
+    const pull = async (table, tableNameInRes) => {
+      let timeFilter = '(COALESCE(updated_at, created_at) > $2 OR deleted_at > $2)';
+      
+      if (['role_permissions', 'user_points'].includes(table)) {
+          if (table === 'role_permissions') {
+             const q = `
+                SELECT rp.* 
+                FROM role_permissions rp
+                JOIN roles r ON rp.role_id = r.id
+                WHERE r.farm_id = $1
+             `;
+             // Note: role_permissions usually doesn't have updated_at, so we might pull all or fallback
+             // For simplicity, pulling all for the farm is safer for pivot tables unless they have timestamps
+             const r = await client.query(q, [farmId]);
+             responseChanges[tableNameInRes] = { updated: r.rows, created: [], deleted: [] };
+             return;
+          }
+          if (table === 'user_points') {
+              timeFilter = 'created_at > $2';
+          }
+       } else if (table === 'roles') {
+           timeFilter = '(created_at > $2 OR deleted_at > $2)';
+       }
+
+       const q = `
         SELECT * FROM ${table}
         WHERE farm_id = $1
-          AND (deleted_at IS NULL OR deleted_at IS NULL)
-          AND COALESCE(updated_at, created_at) > $2
+          AND ${timeFilter}
       `;
-      const r = await db.query(q, [farmId, cutoffDate]);
-      responseChanges[table] = { updated: r.rows };
+      const r = await client.query(q, [farmId, cutoffDate]);
+      // Dexie expects { created: [], updated: [], deleted: [] } usually, or just a list.
+      // The WatermelonDB style is { changes: { table: { created, updated, deleted } } }
+      // But looking at the user's previous code (src/controllers/syncController.js), it returned:
+      // changes: { pigs: { created: [], updated: updatedPigs, deleted: [] } ... }
+      
+      // We will follow that format.
+      responseChanges[tableNameInRes] = { 
+          created: [], 
+          updated: r.rows, 
+          deleted: [] // We are sending deleted records in 'updated' with deleted_at set, which frontend handles?
+                      // Or we should separate them?
+                      // The src controller put everything in 'updated'. Let's stick to that for now.
+      };
     };
-    await pull('sections');
-    await pull('pens');
-    await pull('pigs');
-    await pull('weight_logs');
-    await pull('breeding_events');
-    await pull('health_events');
-    await pull('feed_inventory');
-    await pull('feed_usage');
-    await pull('access_logs');
-    await pull('user_points');
+
+    // List of tables to pull
+    await pull('sections', 'sections');
+    await pull('pens', 'pens');
+    await pull('pigs', 'pigs');
+    await pull('health_events', 'health_events');
+    await pull('weight_logs', 'weight_logs');
+    await pull('breeding_events', 'breeding_events');
+    await pull('feed_inventory', 'feed_inventory');
+    await pull('feed_usage', 'feed_usage');
+    await pull('access_logs', 'access_logs');
+    await pull('user_points', 'user_points');
+    await pull('roles', 'roles');
+    await pull('role_permissions', 'role_permissions');
+    await pull('medications', 'medications');
 
     res.json({
-      success: true,
-      changes: responseChanges,
-      timestamp: new Date().toISOString()
+        status: 'success',
+        timestamp: new Date().toISOString(),
+        changes: responseChanges
     });
 
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Sync Error:', error);
-    res.status(500).json({ error: 'Error synchronizing data' });
+    res.status(500).json({ error: error.message });
   } finally {
     client.release();
   }
 };
 
-// Separate push endpoint (kept for compatibility)
-const pushChanges = async (req, res) => {
-  const { changes } = req.body;
-  const farmId = req.farmId;
+// --- Compatibility Endpoints ---
 
-  if (!Array.isArray(changes) || changes.length === 0) {
-    return res.json({ status: 'ok', processed: 0 });
-  }
+const pushChanges = sync;
 
-  const client = await db.pool.connect();
-
-  try {
-    await client.query('BEGIN');
-    
-    for (const change of changes) {
-      const { table, type, data } = change;
-
-      if (!SYNC_TABLES.includes(table)) {
-        console.warn(`Attempt to sync blocked table: ${table}`);
-        continue; 
-      }
-
-      if (data) { 
-        data.farm_id = farmId; 
-      }
-
-      if (type === 'create') {
-        const keys = Object.keys(data).filter(k => k !== 'created_at' && k !== 'updated_at');
-        const columns = keys.join(', ');
-        const values = keys.map((_, i) => `$${i + 1}`).join(', ');
-        const params = keys.map(k => data[k]);
-        const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
-        
-        await client.query(
-          `INSERT INTO ${table} (${columns}) VALUES (${values}) 
-           ON CONFLICT (id) DO UPDATE SET ${setClause}`, 
-          params
-        );
-
-      } else if (type === 'update') {
-        const keys = Object.keys(data).filter(k => k !== 'id' && k !== 'farm_id' && k !== 'created_at');
-        if (keys.length > 0) {
-            const setClause = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
-            const params = [data.id, ...keys.map(k => data[k]), farmId]; 
-            
-            await client.query(
-            `UPDATE ${table} SET ${setClause} 
-             WHERE id = $1 AND farm_id = $${keys.length + 2}`,
-            params
-        );
-        }
-
-      } else if (type === 'delete') {
-        await client.query(
-          `UPDATE ${table} SET deleted_at = NOW() 
-           WHERE id = $1 AND farm_id = $2`,
-          [data.id, farmId]
-        );
-      }
-    }
-
-    await client.query('COMMIT');
-    res.json({ status: 'ok', processed: changes.length });
-
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Sync Push Error:', error);
-    res.status(500).json({ error: 'Error synchronizing data' });
-  } finally {
-    client.release();
-  }
-};
-
-// Separate pull endpoint (kept for compatibility)
 const pullChanges = async (req, res) => {
-  const { lastPulledAt } = req.query;
-  const farmId = req.farmId;
-  const cutoffDate = lastPulledAt ? new Date(lastPulledAt) : new Date(0);
-
-  try {
-    const response = {};
-
-    for (const table of SYNC_TABLES) {
-      const result = await db.query(
-        `SELECT * FROM ${table} 
-         WHERE farm_id = $1`,
-         [farmId]
-      );
-      response[table] = result.rows;
+    // GET request adapter for sync
+    try {
+        const { lastPulledAt } = req.query;
+        // Mock request object to reuse sync logic
+        const mockReq = {
+            ...req,
+            body: {
+                lastPulledAt,
+                changes: {} // No changes to push
+            },
+            user: req.user
+        };
+        
+        await sync(mockReq, res);
+    } catch (error) {
+        console.error('Pull Error:', error);
+        res.status(500).json({ error: error.message });
     }
-
-    const roles = await db.query('SELECT * FROM roles WHERE farm_id = $1', [farmId]);
-    response['roles'] = roles.rows;
-
-    res.json({
-        changes: response,
-        timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    console.error('Sync Pull Error:', error);
-    res.status(500).json({ error: 'Error fetching updates' });
-  }
 };
 
 module.exports = { sync, pushChanges, pullChanges };
