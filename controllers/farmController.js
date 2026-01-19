@@ -73,24 +73,7 @@ const createFarm = async (req, res) => {
 // List all farms
 const listFarms = async (req, res) => {
   try {
-    // Get all farms with user counts
-    // Note: Current DB schema doesn't have farm_id in pigs table yet
-    const result = await db.query(`
-      SELECT 
-        f.id, 
-        f.name, 
-        f.plan, 
-        f.created_at,
-        COUNT(DISTINCT u.id) as user_count
-      FROM farms f
-      LEFT JOIN users u ON f.id = u.farm_id AND u.deleted_at IS NULL
-      WHERE f.deleted_at IS NULL
-      GROUP BY f.id, f.name, f.plan, f.created_at
-      ORDER BY f.created_at DESC
-    `);
-
-    // Enhance with admin email (fetching separately to avoid complex group by logic or subquery perf issues on large datasets, though subquery is fine here)
-    // Let's use a subquery approach for cleaner code in one go
+    // Get all farms with user counts and admin email
     const query = `
       SELECT 
         f.id, 
