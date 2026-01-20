@@ -15,9 +15,38 @@ const sync = async (req, res) => {
 
     // --- Helper Functions (Closure over client & farmId) ---
 
+    const isValidUUID = (id) => {
+        return typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    };
+
     const upsertPigs = async (rows) => {
         for (const r of rows) {
           if (!r || !r.id) continue;
+          
+          let pigId = r.id;
+
+          // Validate UUID
+          if (!isValidUUID(pigId)) {
+              console.warn(`Invalid UUID for pig: ${pigId}. Attempting recovery by tag_number...`);
+              // Try to find by tag_number to recover the real UUID
+              if (r.tag_number || r.numero_arete) {
+                  const tag = r.tag_number || r.numero_arete;
+                  const found = await client.query(
+                      'SELECT id FROM pigs WHERE farm_id = $1 AND (tag_number = $2 OR numero_arete = $2)', 
+                      [farmId, tag]
+                  );
+                  if (found.rows.length > 0) {
+                      pigId = found.rows[0].id;
+                      console.log(`Recovered UUID for pig ${tag}: ${pigId}`);
+                  } else {
+                      console.error(`Skipping pig with invalid ID ${pigId} and tag ${tag} (not found on server)`);
+                      continue; // Skip to prevent 500 Error
+                  }
+              } else {
+                  console.error(`Skipping pig with invalid ID ${pigId} (no tag to recover)`);
+                  continue;
+              }
+          }
           
           const q = `
             INSERT INTO pigs (
@@ -43,9 +72,9 @@ const sync = async (req, res) => {
           `;
           
           await client.query(q, [
-            r.id, 
+            pigId, 
             farmId, 
-            r.pen_id || null, 
+            (r.pen_id && isValidUUID(r.pen_id)) ? r.pen_id : null, // Only pass valid UUIDs for pen_id to avoid schema mismatch
             r.tag_number, 
             r.sex, 
             r.stage, 
